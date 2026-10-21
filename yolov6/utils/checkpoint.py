@@ -43,8 +43,8 @@ def save_checkpoint(ckpt, is_best, save_dir, model_name=""):
         shutil.copyfile(filename, best_filename)
 
 
-def strip_optimizer(ckpt_dir, epoch):
-    """Delete optimizer from saved checkpoint file"""
+def strip_optimizer(ckpt_dir, epoch, save_fp32=False):
+    """Delete optimizer state and save model weights in the requested precision."""
     for s in ['best', 'last']:
         ckpt_path = osp.join(ckpt_dir, '{}_ckpt.pt'.format(s))
         if not osp.exists(ckpt_path):
@@ -55,7 +55,8 @@ def strip_optimizer(ckpt_dir, epoch):
         for k in ['optimizer', 'ema', 'updates']:  # keys
             ckpt[k] = None
         ckpt['epoch'] = epoch
-        ckpt['model'].half()  # to FP16
+        dtype = torch.float32 if save_fp32 else torch.float16
+        ckpt['model'].to(dtype=dtype)
         for p in ckpt['model'].parameters():
             p.requires_grad = False
         torch.save(ckpt, ckpt_path)

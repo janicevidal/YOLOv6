@@ -9,7 +9,7 @@ from yolov6.assigners.anchor_generator import generate_anchors
 from yolov6.utils.general import dist2bbox, bbox2dist, xywh2xyxy, box_iou
 from yolov6.utils.figure_iou import IOUloss
 from yolov6.assigners.atss_assigner import ATSSAssigner
-from yolov6.assigners.tal_assigner import TaskAlignedAssigner
+from yolov6.assigners.build import build_assigner
 
 class ComputeLoss:
     '''Loss computation func.'''
@@ -27,6 +27,10 @@ class ComputeLoss:
                      'class': 1.0,
                      'iou': 2.5,
                      'dfl': 0.5},
+                 tal_topk=13,
+                 iou_kwargs=None,
+                 assigner_type='tal',
+                 assigner_kwargs=None,
                  ):
 
         self.fpn_strides = fpn_strides
@@ -39,14 +43,16 @@ class ComputeLoss:
 
         self.warmup_epoch = warmup_epoch
         self.warmup_assigner = ATSSAssigner(9, num_classes=self.num_classes)
-        self.formal_assigner = TaskAlignedAssigner(topk=13, num_classes=self.num_classes, alpha=1.0, beta=6.0)
+        self.formal_assigner = build_assigner(
+            assigner_type, self.num_classes, tal_topk, assigner_kwargs, fpn_strides=self.fpn_strides)
 
         self.use_dfl = use_dfl
         self.reg_max = reg_max
         self.proj = nn.Parameter(torch.linspace(0, self.reg_max, self.reg_max + 1), requires_grad=False)
         self.iou_type = iou_type
         self.varifocal_loss = VarifocalLoss().cuda()
-        self.bbox_loss = BboxLoss(self.num_classes, self.reg_max, self.use_dfl, self.iou_type).cuda()
+        self.bbox_loss = BboxLoss(self.num_classes, self.reg_max, self.use_dfl,
+                                  self.iou_type, iou_kwargs=iou_kwargs).cuda()
         self.loss_weight = loss_weight
 
     def __call__(
@@ -100,7 +106,8 @@ class ComputeLoss:
                         anchor_points,
                         gt_labels,
                         gt_bboxes,
-                        mask_gt)
+                        mask_gt,
+                        stride_tensor=stride_tensor)
 
         except RuntimeError:
             print(
@@ -144,7 +151,8 @@ class ComputeLoss:
                         _anchor_points,
                         _gt_labels,
                         _gt_bboxes,
-                        _mask_gt)
+                        _mask_gt,
+                        stride_tensor=_stride_tensor)
 
             target_labels = target_labels.cuda()
             target_bboxes = target_bboxes.cuda()
@@ -212,10 +220,11 @@ class VarifocalLoss(nn.Module):
 
 
 class BboxLoss(nn.Module):
-    def __init__(self, num_classes, reg_max, use_dfl=False, iou_type='giou'):
+    def __init__(self, num_classes, reg_max, use_dfl=False, iou_type='giou', iou_kwargs=None):
         super(BboxLoss, self).__init__()
         self.num_classes = num_classes
-        self.iou_loss = IOUloss(box_format='xyxy', iou_type=iou_type, eps=1e-10)
+        self.iou_loss = IOUloss(box_format='xyxy', iou_type=iou_type, eps=1e-10,
+                                **(iou_kwargs or {}))
         self.reg_max = reg_max
         self.use_dfl = use_dfl
 

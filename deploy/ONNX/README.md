@@ -19,8 +19,11 @@ python ./deploy/ONNX/export_onnx.py \
 #### Description of all arguments
 
 - `--weights` : The path of yolov6 model weights.
+- `--output` : Output ONNX file path; defaults to a file beside the checkpoint.
 - `--img` : Image size of model inputs.
 - `--batch` : Batch size of model inputs.
+- `--dynamic-batch` : Keep the batch dimension dynamic; spatial dimensions stay fixed.
+- `--opset` : ONNX opset; defaults to 16 when the model contains DySample and 13 otherwise.
 - `--half` : Whether to export half-precision model.
 - `--inplace` : Whether to set Detect() inplace.
 - `--simplify` : Whether to simplify onnx. Not support in end to end export.
@@ -32,6 +35,70 @@ python ./deploy/ONNX/export_onnx.py \
 - `--iou-thres` : IoU threshold for NMS algorithm.
 - `--conf-thres` : Confidence threshold for NMS algorithm.
 - `--device` : Export device. Cuda device : 0 or 0,1,2,3 ... , CPU : cpu .
+
+## Pico deployment and export
+
+The exporter calls `PicoBlock.switch_to_deploy()` after loading the checkpoint
+in evaluation mode. It fuses the four small parallel depthwise branches into one
+3x3 convolution and folds the final pointwise convolution's BN. The sequential
+1x7/7x1 depthwise pair is composed into one 7x7 depthwise convolution in the
+deployment model and ONNX graph, using the per-channel outer product of the kernels.
+The multi-scale channel split,
+concatenation, first BN, activation and outer residual remain. The entire block
+cannot collapse into a single convolution because its residual follows an
+activation. Conversion preserves device/dtype and supports repeated calls.
+
+To convert a backbone in Python:
+
+```python
+from yolov6.utils.checkpoint import load_checkpoint
+
+model = load_checkpoint('pico.pt', map_location='cpu', fuse=False)
+model.eval()
+model.backbone.switch_to_deploy()
+```
+
+The checkpoint is loaded before conversion; its file is not rewritten. The
+existing `model.backbone.fuse()` method is an alias for this conversion.
+
+New Pico models default to `model.neck.upsample_type='nearest'`, producing ONNX
+Resize nodes without GridSample. Full-model export supports PyTorch 1.10 and
+defaults to opset 13:
+
+```bash
+python deploy/ONNX/export_onnx.py --weights pico.pt \
+    --img-size 416 --device cpu --dynamic-batch --simplify
+```
+
+Setting `upsample_type='dysample'` enables learned sampling. Such models include
+`grid_sample`, requiring PyTorch 1.13 or newer, `onnx>=1.12`, and ONNX opset 16
+or newer. Use a separate export environment if training runs on PyTorch 1.10:
+
+```bash
+python deploy/ONNX/export_onnx.py --weights pico.pt \
+    --img-size 416 --device cpu --opset 16 --dynamic-batch --simplify
+```
+
+This writes `pico.onnx`, containing decoded predictions `[B,N,5+nc]`. The default
+export does not include NMS. When DySample is enabled, the runtime must support
+ONNX `GridSample`; check the target TensorRT/backend version separately. `Detect.export=True` is not
+needed: the existing model export path returns the decoded tensor.
+
+The exporter inspects the loaded checkpoint's modules, so existing DySample
+checkpoints still select opset 16 even after changing the default config.
+
+To save a new 7x7-fused ONNX file from the existing DySample checkpoint with a
+64-channel neck/head:
+
+```bash
+python deploy/ONNX/export_onnx.py \
+    --weights weights/yolov6_pico_64ch/pico_checkpoint.pt \
+    --output weights/yolov6_pico_64ch/pico_7x7.onnx \
+    --img-size 416 --device cpu --opset 16 --dynamic-batch --simplify
+```
+
+Previously exported ONNX files retain their saved graph; re-export to apply
+this conversion. Older factorized deployment checkpoints are also converted.
 
 ## Download
 

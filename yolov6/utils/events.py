@@ -5,6 +5,11 @@ import yaml
 import logging
 import shutil
 
+from PIL import Image
+
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
+    
 
 def set_logging(name=None):
     rank = int(os.getenv('RANK', -1))

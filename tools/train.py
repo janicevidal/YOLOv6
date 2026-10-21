@@ -47,6 +47,7 @@ def get_args_parser(add_help=True):
     parser.add_argument('--write_trainbatch_tb', action='store_true', help='write train_batch image to tensorboard once an epoch, may slightly slower train speed if open')
     parser.add_argument('--stop_aug_last_n_epoch', default=15, type=int, help='stop strong aug at last n epoch, neg value not stop, default 15')
     parser.add_argument('--save_ckpt_on_last_n_epoch', default=-1, type=int, help='save last n epoch even not best or last, neg value not save')
+    parser.add_argument('--save-fp32', action='store_true', help='save model and EMA weights in FP32 instead of FP16')
     parser.add_argument('--distill', action='store_true', help='distill or not')
     parser.add_argument('--distill_feat', action='store_true', help='distill featmap or not')
     parser.add_argument('--quant', action='store_true', help='quant or not')
@@ -66,6 +67,7 @@ def check_and_init(args):
     '''check config files and device.'''
     # check files
     master_process = args.rank == 0 if args.world_size > 1 else args.rank == -1
+    save_fp32 = getattr(args, 'save_fp32', False)
     if args.resume:
         # args.resume can be a checkpoint file path or a boolean value.
         checkpoint_path = args.resume if isinstance(args.resume, str) else find_latest_checkpoint()
@@ -85,6 +87,8 @@ def check_and_init(args):
         args.save_dir = str(increment_name(osp.join(args.output_dir, args.name)))
         if master_process:
             os.makedirs(args.save_dir)
+
+    args.save_fp32 = save_fp32 or getattr(args, 'save_fp32', False)
 
     # check specific shape
     if args.specific_shape:

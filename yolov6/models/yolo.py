@@ -8,6 +8,9 @@ from yolov6.layers.common import *
 from yolov6.utils.torch_utils import initialize_weights
 from yolov6.models.efficientrep import *
 from yolov6.models.reppan import *
+from yolov6.models.pico_backbone import PicoBackbone
+from yolov6.models.lite_backbone import LiteBackbone
+from yolov6.models.pico_neck import PicoNeck
 from yolov6.utils.events import LOGGER
 
 
@@ -52,7 +55,7 @@ def make_divisible(x, divisor):
     return math.ceil(x / divisor) * divisor
 
 
-def build_network(config, channels, num_classes, num_layers, fuse_ab=False, distill_ns=False):
+def _build_rep_backbone_neck(config, channels):
     depth_mul = config.model.depth_multiple
     width_mul = config.model.width_multiple
     num_repeat_backbone = config.model.backbone.num_repeats
@@ -61,8 +64,6 @@ def build_network(config, channels, num_classes, num_layers, fuse_ab=False, dist
     cspsppf = config.model.backbone.get('cspsppf')
     num_repeat_neck = config.model.neck.num_repeats
     channels_list_neck = config.model.neck.out_channels
-    use_dfl = config.model.head.use_dfl
-    reg_max = config.model.head.reg_max
     num_repeat = [(max(round(i * depth_mul), 1) if i > 1 else i) for i in (num_repeat_backbone + num_repeat_neck)]
     channels_list = [make_divisible(i * width_mul, 8) for i in (channels_list_backbone + channels_list_neck)]
 
@@ -111,7 +112,57 @@ def build_network(config, channels, num_classes, num_layers, fuse_ab=False, dist
             block=block
         )
 
-    if distill_ns:
+    return backbone, neck, channels_list
+
+
+def _build_pico_backbone_neck(config, channels, num_layers):
+    backbones = {'PicoBackbone': PicoBackbone, 'LiteBackbone': LiteBackbone}
+    backbone_type = config.model.backbone.type
+    if backbone_type not in backbones or config.model.neck.type != 'PicoNeck':
+        raise ValueError('Configure PicoNeck with PicoBackbone or LiteBackbone')
+    if num_layers != 3 or list(config.model.head.strides) != [8, 16, 32]:
+        raise ValueError('Pico requires three detection levels with strides [8, 16, 32]')
+
+    backbone_cfg = dict(config.model.backbone)
+    backbone_cfg.pop('type')
+    backbone = backbones[backbone_type](in_channels=channels, **backbone_cfg)
+    required_stages = (0, 1, 2) if backbone_type == 'PicoBackbone' else (2, 3, 4)
+    if tuple(backbone.out_stages) != required_stages:
+        raise ValueError(f'{backbone_type} must output backbone stages {required_stages} for YOLOv6')
+
+    neck_cfg = dict(config.model.neck)
+    neck_cfg.pop('type')
+    neck_channels = neck_cfg.pop('in_channels', backbone.out_channels)
+    if list(neck_channels) != backbone.out_channels:
+        raise ValueError('PicoNeck input channels must match backbone outputs')
+    if neck_cfg.get('num_extra_level', 0) != 0:
+        raise ValueError('The three-level Pico detection head requires num_extra_level=0')
+    neck = PicoNeck(in_channels=backbone.out_channels, **neck_cfg)
+    head_channels = [neck.out_channels] * num_layers
+    if list(config.model.head.get('in_channels', head_channels)) != head_channels:
+        raise ValueError('Detection head input channels must match PicoNeck outputs')
+    return backbone, neck, head_channels
+
+
+def build_network(config, channels, num_classes, num_layers, fuse_ab=False, distill_ns=False):
+    if config.model.backbone.type in ('PicoBackbone', 'LiteBackbone') or config.model.neck.type == 'PicoNeck':
+        backbone, neck, channels_list = _build_pico_backbone_neck(config, channels, num_layers)
+    else:
+        backbone, neck, channels_list = _build_rep_backbone_neck(config, channels)
+    use_dfl = config.model.head.use_dfl
+    reg_max = config.model.head.reg_max
+
+    if config.model.head.type == 'PicoHead':
+        if config.model.backbone.type not in ('PicoBackbone', 'LiteBackbone') or config.model.neck.type != 'PicoNeck':
+            raise ValueError('PicoHead requires PicoNeck with PicoBackbone or LiteBackbone')
+        if fuse_ab or distill_ns:
+            raise ValueError('PicoHead does not support fuse_ab or distillation')
+        if use_dfl or reg_max != 0:
+            raise ValueError('PicoHead requires use_dfl=False and reg_max=0 for direct LTRB regression')
+        from yolov6.models.heads.effidehead_pico import Detect
+        head = Detect(num_classes, channels_list, config.model.head.strides)
+
+    elif distill_ns:
         from yolov6.models.heads.effidehead_distill_ns import Detect, build_effidehead_layer
         if num_layers != 3:
             LOGGER.error('ERROR in: Distill mode not fit on n/s models with P6 head.\n')

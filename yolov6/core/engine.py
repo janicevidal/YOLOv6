@@ -33,11 +33,13 @@ from yolov6.solver.build import build_optimizer, build_lr_scheduler
 from yolov6.utils.RepOptimizer import extract_scales, RepVGGOptimizer
 from yolov6.utils.nms import xywh2xyxy
 from yolov6.utils.general import download_ckpt
+from yolov6.utils.plots import plot_lr_scheduler
 
 
 class Trainer:
     def __init__(self, args, cfg, device):
         self.args = args
+        self.ckpt_dtype = torch.float32 if getattr(args, 'save_fp32', False) else torch.float16
         self.cfg = cfg
         self.device = device
         self.max_epoch = args.epochs
@@ -69,7 +71,6 @@ class Trainer:
             self.optimizer = RepVGGOptimizer(model, scales, args, cfg, reinit=reinit)
         else:
             self.optimizer = self.get_optimizer(args, cfg, model)
-        self.scheduler, self.lf = self.get_lr_scheduler(args, cfg, self.optimizer)
         self.ema = ModelEMA(model) if self.main_process else None
         # tensorboard
         self.tblogger = SummaryWriter(self.save_dir) if self.main_process else None
@@ -79,8 +80,6 @@ class Trainer:
             resume_state_dict = self.ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
             model.load_state_dict(resume_state_dict, strict=True)  # load
             self.start_epoch = self.ckpt['epoch'] + 1
-            self.optimizer.load_state_dict(self.ckpt['optimizer'])
-            self.scheduler.load_state_dict(self.ckpt['scheduler'])
             if self.main_process:
                 self.ema.ema.load_state_dict(self.ckpt['ema'].float().state_dict())
                 self.ema.updates = self.ckpt['updates']
@@ -89,11 +88,17 @@ class Trainer:
                 self.cfg.data_aug.mixup = 0.0
 
         self.train_loader, self.val_loader = self.get_data_loader(self.args, self.cfg, self.data_dict)
+        self.max_stepnum = len(self.train_loader)
+        self.scheduler, self.lf = self.get_lr_scheduler(args, cfg, self.optimizer, self.max_stepnum)
+        # Scheduler construction sets initial LRs. Restore saved optimizer LRs
+        # afterwards so iteration-based warmup resumes at the exact saved point.
+        if hasattr(self, 'ckpt'):
+            self.optimizer.load_state_dict(self.ckpt['optimizer'])
+            self.scheduler.load_state_dict(self.ckpt['scheduler'])
 
         self.model = self.parallel_model(args, model, device)
         self.model.nc, self.model.names = self.data_dict['nc'], self.data_dict['names']
 
-        self.max_stepnum = len(self.train_loader)
         self.batch_size = args.batch_size
         self.img_size = args.img_size
         self.rect = args.rect
@@ -176,8 +181,11 @@ class Trainer:
         self.update_optimizer()
 
     def after_epoch(self):
-        lrs_of_this_epoch = [x['lr'] for x in self.optimizer.param_groups]
-        self.scheduler.step() # update lr
+        if getattr(self.scheduler, 'by_iteration', False):
+            lrs_of_this_epoch = self.current_lrs
+        else:
+            lrs_of_this_epoch = [x['lr'] for x in self.optimizer.param_groups]
+            self.scheduler.step() # update lr
         if self.main_process:
             self.ema.update_attr(self.model, include=['nc', 'names', 'stride']) # update attributes for ema model
 
@@ -190,13 +198,18 @@ class Trainer:
                 self.best_ap = max(self.ap, self.best_ap)
             # save ckpt
             ckpt = {
-                    'model': deepcopy(de_parallel(self.model)).half(),
-                    'ema': deepcopy(self.ema.ema).half(),
+                    'model': deepcopy(de_parallel(self.model)).to(dtype=self.ckpt_dtype),
+                    'ema': deepcopy(self.ema.ema).to(dtype=self.ckpt_dtype),
                     'updates': self.ema.updates,
                     'optimizer': self.optimizer.state_dict(),
                     'scheduler': self.scheduler.state_dict(),
                     'epoch': self.epoch,
                     'results': self.evaluate_results,
+                    'iou_loss_state': {
+                        name: getattr(self, name).bbox_loss.iou_loss.state_dict()
+                        for name in ('compute_loss', 'compute_loss_ab', 'compute_loss_distill')
+                        if hasattr(self, name) and getattr(self, name).bbox_loss.iou_loss.iou_type == 'wiou'
+                    },
                     }
 
             save_ckpt_dir = osp.join(self.save_dir, 'weights')
@@ -217,7 +230,8 @@ class Trainer:
             # log for tensorboard
             write_tblog(self.tblogger, self.epoch, self.evaluate_results, lrs_of_this_epoch, self.mean_loss)
             # save validation predictions to tensorboard
-            write_tbimg(self.tblogger, self.vis_imgs_list, self.epoch, type='val')
+            if is_val_epoch:
+                write_tbimg(self.tblogger, self.vis_imgs_list, self.epoch, type='val')
 
     def eval_model(self):
         if not hasattr(self.cfg, "eval_params"):
@@ -272,8 +286,21 @@ class Trainer:
     def before_train_loop(self):
         LOGGER.info('Training start...')
         self.start_time = time.time()
-        self.warmup_stepnum = max(round(self.cfg.solver.warmup_epochs * self.max_stepnum), 1000) if self.args.quant is False else 0
-        self.scheduler.last_epoch = self.start_epoch - 1
+        if getattr(self.scheduler, 'by_iteration', False):
+            self.warmup_stepnum = self.scheduler.warmup_iters
+        else:
+            self.warmup_stepnum = max(round(self.cfg.solver.warmup_epochs * self.max_stepnum), 1000) if self.args.quant is False else 0
+            self.scheduler.last_epoch = self.start_epoch - 1
+        if self.main_process:
+            plot_lr_scheduler(
+                self.optimizer, self.scheduler,
+                total_iters=self.max_epoch * self.max_stepnum,
+                save_dir=osp.join(self.save_dir, 'weights'),
+                steps_per_epoch=self.max_stepnum,
+                warmup_iters=self.warmup_stepnum,
+                warmup_bias_lr=self.cfg.solver.get('warmup_bias_lr', 0.0),
+                start_iter=self.start_epoch * self.max_stepnum,
+            )
         self.last_opt_step = -1
         self.scaler = amp.GradScaler(enabled=self.device != 'cpu')
 
@@ -293,7 +320,11 @@ class Trainer:
                                         use_dfl=self.cfg.model.head.use_dfl,
                                         reg_max=self.cfg.model.head.reg_max,
                                         iou_type=self.cfg.model.head.iou_type,
-					                    fpn_strides=self.cfg.model.head.strides)
+                                        iou_kwargs=self.cfg.model.head.get('iou_kwargs'),
+                                        tal_topk=self.cfg.model.head.get('tal_topk', 13),
+                                        assigner_type=self.cfg.model.head.get('assigner_type', 'tal'),
+                                        assigner_kwargs=self.cfg.model.head.get('assigner_kwargs'),
+                                        fpn_strides=self.cfg.model.head.strides)
 
         if self.args.fuse_ab:
             self.compute_loss_ab = ComputeLoss_ab(num_classes=self.data_dict['nc'],
@@ -302,6 +333,10 @@ class Trainer:
                                         use_dfl=False,
                                         reg_max=0,
                                         iou_type=self.cfg.model.head.iou_type,
+                                        iou_kwargs=self.cfg.model.head.get('iou_kwargs'),
+                                        tal_topk=self.cfg.model.head.get('tal_topk_ab', 26),
+                                        assigner_type=self.cfg.model.head.get('assigner_type', 'tal'),
+                                        assigner_kwargs=self.cfg.model.head.get('assigner_kwargs'),
                                         fpn_strides=self.cfg.model.head.strides,
                                         )
         if self.args.distill :
@@ -317,9 +352,21 @@ class Trainer:
                                                         use_dfl=self.cfg.model.head.use_dfl,
                                                         reg_max=self.cfg.model.head.reg_max,
                                                         iou_type=self.cfg.model.head.iou_type,
+                                                        iou_kwargs=self.cfg.model.head.get('iou_kwargs'),
                                                         distill_weight = self.cfg.model.head.distill_weight,
                                                         distill_feat = self.args.distill_feat,
+                                                        tal_topk=self.cfg.model.head.get('tal_topk', 13),
+                                                        assigner_type=self.cfg.model.head.get('assigner_type', 'tal'),
+                                                        assigner_kwargs=self.cfg.model.head.get('assigner_kwargs'),
                                                         )
+
+        # Stateful WIoU means belong to the loss, rather than the detector model.
+        if hasattr(self, 'ckpt'):
+            for name, state in self.ckpt.get('iou_loss_state', {}).items():
+                if hasattr(self, name):
+                    iou_loss = getattr(self, name).bbox_loss.iou_loss
+                    if iou_loss.iou_type == 'wiou':
+                        iou_loss.load_state_dict(state)
 
     def before_epoch(self):
         #stop strong aug like mosaic and mixup from last n epoch by recreate dataloader
@@ -343,14 +390,16 @@ class Trainer:
     def print_details(self):
         if self.main_process:
             self.mean_loss = (self.mean_loss * self.step + self.loss_items) / (self.step + 1)
+            lr = self.current_lrs[0] if getattr(self.scheduler, 'by_iteration', False) else self.scheduler.get_last_lr()[0]
             self.pbar.set_description(('%10s' + ' %10.4g' + '%10.4g' * self.loss_num) % (f'{self.epoch}/{self.max_epoch - 1}', \
-                                                                self.scheduler.get_last_lr()[0], *(self.mean_loss)))
+                                                                lr, *(self.mean_loss)))
 
     def strip_model(self):
         if self.main_process:
             LOGGER.info(f'\nTraining completed in {(time.time() - self.start_time) / 3600:.3f} hours.')
             save_ckpt_dir = osp.join(self.save_dir, 'weights')
-            strip_optimizer(save_ckpt_dir, self.epoch)  # strip optimizers for saved pt model
+            strip_optimizer(save_ckpt_dir, self.epoch,
+                            save_fp32=getattr(self.args, 'save_fp32', False))
 
     # Empty cache if training finished
     def train_after_loop(self):
@@ -359,14 +408,17 @@ class Trainer:
 
     def update_optimizer(self):
         curr_step = self.step + self.max_stepnum * self.epoch
+        by_iteration = getattr(self.scheduler, 'by_iteration', False)
         self.accumulate = max(1, round(64 / self.batch_size))
-        if curr_step <= self.warmup_stepnum:
+        if curr_step <= self.warmup_stepnum and (not by_iteration or self.warmup_stepnum > 0):
             self.accumulate = max(1, np.interp(curr_step, [0, self.warmup_stepnum], [1, 64 / self.batch_size]).round())
             for k, param in enumerate(self.optimizer.param_groups):
-                warmup_bias_lr = self.cfg.solver.warmup_bias_lr if k == 2 else 0.0
-                param['lr'] = np.interp(curr_step, [0, self.warmup_stepnum], [warmup_bias_lr, param['initial_lr'] * self.lf(self.epoch)])
+                if not by_iteration:
+                    warmup_bias_lr = self.cfg.solver.warmup_bias_lr if k == 2 else 0.0
+                    param['lr'] = np.interp(curr_step, [0, self.warmup_stepnum], [warmup_bias_lr, param['initial_lr'] * self.lf(self.epoch)])
                 if 'momentum' in param:
                     param['momentum'] = np.interp(curr_step, [0, self.warmup_stepnum], [self.cfg.solver.warmup_momentum, self.cfg.solver.momentum])
+        self.current_lrs = [group['lr'] for group in self.optimizer.param_groups]
         if curr_step - self.last_opt_step >= self.accumulate:
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -374,6 +426,9 @@ class Trainer:
             if self.ema:
                 self.ema.update(self.model)
             self.last_opt_step = curr_step
+        if by_iteration:
+            # Boundaries count batches, including gradient accumulation/AMP skips.
+            self.scheduler.step()
 
     @staticmethod
     def get_data_loader(args, cfg, data_dict):
@@ -410,6 +465,8 @@ class Trainer:
         return images, targets
 
     def get_model(self, args, cfg, nc, device):
+        if cfg.model.head.type == 'PicoHead' and args.distill:
+            raise ValueError('PicoHead does not support the existing DFL-based distillation losses')
         if 'YOLOv6-lite' in cfg.model.type:
             assert not self.args.fuse_ab, 'ERROR in: YOLOv6-lite models not support fuse_ab mode.'
             assert not self.args.distill, 'ERROR in: YOLOv6-lite models not support distill mode.'
@@ -475,9 +532,9 @@ class Trainer:
         return optimizer
 
     @staticmethod
-    def get_lr_scheduler(args, cfg, optimizer):
+    def get_lr_scheduler(args, cfg, optimizer, steps_per_epoch=None):
         epochs = args.epochs
-        lr_scheduler, lf = build_lr_scheduler(cfg, optimizer, epochs)
+        lr_scheduler, lf = build_lr_scheduler(cfg, optimizer, epochs, steps_per_epoch)
         return lr_scheduler, lf
 
     def plot_train_batch(self, images, targets, max_size=1920, max_subplots=16):
@@ -567,7 +624,7 @@ class Trainer:
             LOGGER.info('Saving calibrated model to {}... '.format(output_model_path))
             if not os.path.exists(cfg.ptq.calib_output_path):
                 os.mkdir(cfg.ptq.calib_output_path)
-            torch.save({'model': deepcopy(de_parallel(model)).half()}, output_model_path)
+            torch.save({'model': deepcopy(de_parallel(model)).to(dtype=self.ckpt_dtype)}, output_model_path)
         assert self.args.quant is True and self.args.calib is True
         if self.main_process:
             from tools.qat.qat_utils import ptq_calibrate

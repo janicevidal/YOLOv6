@@ -143,7 +143,7 @@ class Evaler:
 
             # for tensorboard visualization, maximum images to show: 8
             if i == 0:
-                vis_num = min(len(imgs), 8)
+                vis_num = min(len(imgs), 5)
                 vis_outputs = outputs[:vis_num]
                 vis_paths = paths[:vis_num]
 

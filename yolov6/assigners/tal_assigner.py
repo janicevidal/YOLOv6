@@ -11,6 +11,8 @@ class TaskAlignedAssigner(nn.Module):
                  beta=6.0,
                  eps=1e-9):
         super(TaskAlignedAssigner, self).__init__()
+        if isinstance(topk, bool) or not isinstance(topk, int) or topk <= 0:
+            raise ValueError('TaskAlignedAssigner topk must be a positive integer')
         self.topk = topk
         self.num_classes = num_classes
         self.bg_idx = num_classes
@@ -25,7 +27,8 @@ class TaskAlignedAssigner(nn.Module):
                 anc_points,
                 gt_labels,
                 gt_bboxes,
-                mask_gt):
+                mask_gt,
+                stride_tensor=None):
         """This code referenced to
            https://github.com/Nioolek/PPYOLOE_pytorch/blob/master/ppyoloe/assigner/tal_assigner.py
 
@@ -36,6 +39,7 @@ class TaskAlignedAssigner(nn.Module):
             gt_labels (Tensor): shape(bs, n_max_boxes, 1)
             gt_bboxes (Tensor): shape(bs, n_max_boxes, 4)
             mask_gt (Tensor): shape(bs, n_max_boxes, 1)
+            stride_tensor (Tensor, optional): unused; shared AlignOTA interface.
         Returns:
             target_labels (Tensor): shape(bs, num_total_anchors)
             target_bboxes (Tensor): shape(bs, num_total_anchors, 4)
