@@ -1,8 +1,8 @@
 """
 PicoNeck feature pyramid network for YOLOv6.
 
-Uses nearest-neighbor upsampling by default, with optional DySample (ICCV 2023)
-from FlashDownUP for learned point sampling in the top-down path.
+Uses nearest-neighbor upsampling by default, with optional SNI feature scaling
+or DySample (ICCV 2023) learned point sampling in the top-down path.
 """
 
 import math
@@ -11,6 +11,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from yolov6.layers.conv_module import ConvModule, DepthwiseConvModule
+
+
+class SNI(nn.Module):
+    """Soft nearest-neighbor interpolation from rethinking-fpn.
+
+    https://github.com/AlanLi1997/rethinking-fpn
+    Scale nearest-neighbor features by 1 / up_f**2 without learned parameters.
+    c1 and c2 are accepted for compatibility; channels are preserved.
+    """
+
+    def __init__(self, c1=0, c2=0, up_f=2):
+        super().__init__()
+        self.us = nn.Upsample(scale_factor=up_f, mode="nearest")
+        self.alpha = 1 / (up_f ** 2)
+
+    def forward(self, x):
+        return self.alpha * self.us(x)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +139,8 @@ class LiteModule(nn.Module):
             act = nn.Identity()
         elif activation == "LeakyReLU":
             act = nn.LeakyReLU(0.1, inplace=True)
+        elif activation == "SiLU":
+            act = nn.SiLU(inplace=True)
         else:
             act = nn.ReLU(inplace=True)
 
@@ -247,7 +266,7 @@ class LiteBlocks(nn.Module):
 class PicoNeck(nn.Module):
     """Lightweight Path Aggregation Network (PAN) for feature fusion.
 
-    Supports nearest-neighbor interpolation and optional learned DySample.
+    Supports nearest-neighbor interpolation, SNI and learned DySample.
 
     Args:
         in_channels: Input channel list from backbone.
@@ -256,7 +275,7 @@ class PicoNeck(nn.Module):
         num_extra_level: Number of extra output levels.
         use_depthwise: Whether to use depthwise separable conv.
         activation: Activation function name.
-        upsample_type: "nearest" (default) or "dysample" for top-down fusion.
+        upsample_type: "nearest" (default), "sni" or "dysample" for top-down fusion.
     """
 
     def __init__(
@@ -273,8 +292,8 @@ class PicoNeck(nn.Module):
         upsample_type: str = "nearest",
     ):
         super().__init__()
-        if upsample_type not in ("nearest", "dysample"):
-            raise ValueError('upsample_type must be "nearest" or "dysample"')
+        if upsample_type not in ("nearest", "sni", "dysample"):
+            raise ValueError('upsample_type must be "nearest", "sni" or "dysample"')
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -285,11 +304,13 @@ class PicoNeck(nn.Module):
         # One upsampler per top-down transition.
         self.upsamplers = nn.ModuleList()
         for _ in range(len(in_channels) - 1):
-            self.upsamplers.append(
-                DySample(out_channels, scale=2, groups=4, style="lp")
-                if upsample_type == "dysample"
-                else nn.Upsample(scale_factor=2, mode="nearest")
-            )
+            if upsample_type == "dysample":
+                upsampler = DySample(out_channels, scale=2, groups=4, style="lp")
+            elif upsample_type == "sni":
+                upsampler = SNI(out_channels, out_channels, up_f=2)
+            else:
+                upsampler = nn.Upsample(scale_factor=2, mode="nearest")
+            self.upsamplers.append(upsampler)
 
         # Reduce layers (lateral connections)
         self.reduce_layers = nn.ModuleList()
@@ -364,6 +385,8 @@ class PicoNeck(nn.Module):
                 # not have upsample_type. Keep nearest mode for odd sizes.
                 if isinstance(upsampler, DySample):
                     upsample_feat = F.interpolate(upsample_feat, size=feat_low.shape[2:], mode="bilinear", align_corners=False)
+                elif isinstance(upsampler, SNI):
+                    upsample_feat = upsampler.alpha * F.interpolate(feat_high, size=feat_low.shape[2:], mode="nearest")
                 else:
                     upsample_feat = F.interpolate(feat_high, size=feat_low.shape[2:], mode="nearest")
 

@@ -54,7 +54,12 @@ def get_args_parser(add_help=True):
     parser.add_argument('--calib', action='store_true', help='run ptq')
     parser.add_argument('--teacher_model_path', type=str, default=None, help='teacher model path')
     parser.add_argument('--temperature', type=int, default=20, help='distill temperature')
-    parser.add_argument('--fuse_ab', action='store_true', help='fuse ab branch in training process or not')
+    fuse_ab_group = parser.add_mutually_exclusive_group()
+    fuse_ab_group.add_argument('--fuse_ab', '--fuse-ab', dest='fuse_ab', action='store_true',
+                               help='enable AB auxiliary training (default: model.head.fuse_ab)')
+    fuse_ab_group.add_argument('--no-fuse-ab', dest='fuse_ab', action='store_false',
+                               help='disable AB auxiliary training, overriding the config')
+    parser.set_defaults(fuse_ab=None)
     parser.add_argument('--bs_per_gpu', default=32, type=int, help='batch size per GPU for auto-rescale learning rate, set to 16 for P6 models')
     parser.add_argument('--specific-shape', action='store_true', help='rectangular training')
     parser.add_argument('--height', type=int, default=None, help='image height of model input')
@@ -100,6 +105,8 @@ def check_and_init(args):
         args.img_size = check_img_size(args.img_size, 32, floor=256)
 
     cfg = Config.fromfile(args.conf_file)
+    if getattr(args, 'fuse_ab', None) is None:
+        args.fuse_ab = cfg.model.head.get('fuse_ab', False)
     if not hasattr(cfg, 'training_mode'):
         setattr(cfg, 'training_mode', 'repvgg')
     # check device

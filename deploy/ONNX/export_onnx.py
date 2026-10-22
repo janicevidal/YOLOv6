@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from yolov6.models.yolo import *
 from yolov6.models.effidehead import Detect
+from yolov6.models.heads.effidehead_pico import Detect as PicoDetect
 from yolov6.layers.common import *
 from yolov6.layers.reparam import PicoBlock
 from yolov6.models.pico_neck import DySample
@@ -23,9 +24,17 @@ from yolov6.utils.general import check_version
 from io import BytesIO
 
 
-def prepare_model_for_export(model):
-    """Convert supported reparameterizable blocks before tracing the model."""
+def prepare_model_for_export(model, raw_head=False):
+    """Convert deployment blocks and select decoded or raw Pico outputs."""
+    is_pico = isinstance(getattr(model, 'detect', None), PicoDetect)
+    if raw_head and not is_pico:
+        raise ValueError('--raw-head currently supports PicoHead only')
     model.eval()
+    if is_pico:
+        # Model.export controls the outer return value; Detect.export skips
+        # anchor generation and LTRB decoding inside the detection head.
+        model.export = raw_head
+        model.detect.export = raw_head
     for layer in list(model.modules()):
         if isinstance(layer, (RepVGGBlock, PicoBlock)):
             layer.switch_to_deploy()
@@ -58,7 +67,10 @@ if __name__ == '__main__':
     parser.add_argument('--simplify', action='store_true', help='simplify onnx model')
     parser.add_argument('--dynamic-batch', action='store_true', help='export dynamic batch onnx model')
     parser.add_argument('--opset', type=int, default=None, help='ONNX opset (default: 16 for DySample, otherwise 13)')
-    parser.add_argument('--end2end', action='store_true', help='export end2end onnx')
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument('--end2end', action='store_true', help='export end2end onnx')
+    output_group.add_argument('--raw-head', action='store_true',
+                              help='export Pico P3/P4/P5 scores and LTRB distances without anchors or decoding')
     parser.add_argument('--trt-version', type=int, default=8, help='tensorrt version')
     parser.add_argument('--ort', action='store_true', help='export onnx for onnxruntime')
     parser.add_argument('--with-preprocess', action='store_true', help='export bgr2rgb and normalize')
@@ -77,10 +89,18 @@ if __name__ == '__main__':
     assert not (device.type == 'cpu' and args.half), '--half only compatible with GPU export, i.e. use --device 0'
     # Load PyTorch model
     model = load_checkpoint(args.weights, map_location=device, inplace=True, fuse=True)  # load FP32 model
-    output_names = ['num_dets', 'det_boxes', 'det_scores', 'det_classes'] if args.end2end else ['outputs']
+    if args.end2end:
+        output_names = ['num_dets', 'det_boxes', 'det_scores', 'det_classes']
+    elif args.raw_head:
+        output_names = ['p3', 'p4', 'p5']
+    else:
+        output_names = ['outputs']
     opset = select_opset(model, args.opset)
-    model = prepare_model_for_export(model)
+    model = prepare_model_for_export(model, raw_head=args.raw_head)
     LOGGER.info(f'Exporting with ONNX opset {opset}')
+    if args.raw_head:
+        LOGGER.info('Raw Pico outputs: p3/p4/p5 [B,nc+4,H,W], channels=[class probabilities,l,t,r,b]. '
+                    'Decode boxes and run NMS in the deployment postprocessor.')
     # Input
     img = torch.zeros(args.batch_size, 3, *args.img_size).to(device)  # image size(1,3,320,192) iDetection
 

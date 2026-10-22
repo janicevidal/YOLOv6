@@ -38,7 +38,12 @@ from yolov6.utils.plots import plot_lr_scheduler
 
 class Trainer:
     def __init__(self, args, cfg, device):
+        if getattr(args, 'fuse_ab', None) is None:
+            args.fuse_ab = cfg.model.head.get('fuse_ab', False)
         self.args = args
+        self.ab_loss_weight = cfg.model.head.get('ab_loss_weight', 1.0)
+        if not math.isfinite(self.ab_loss_weight) or self.ab_loss_weight < 0:
+            raise ValueError('model.head.ab_loss_weight must be finite and non-negative')
         self.ckpt_dtype = torch.float32 if getattr(args, 'save_fp32', False) else torch.float16
         self.cfg = cfg
         self.device = device
@@ -169,8 +174,8 @@ class Trainer:
                                                             step_num, batch_height, batch_width) # YOLOv6_af
                 total_loss_ab, loss_items_ab = self.compute_loss_ab(preds[:3], targets, epoch_num, step_num,
                                                                      batch_height, batch_width) # YOLOv6_ab
-                total_loss += total_loss_ab
-                loss_items += loss_items_ab
+                total_loss += self.ab_loss_weight * total_loss_ab
+                loss_items += self.ab_loss_weight * loss_items_ab
             else:
                 total_loss, loss_items = self.compute_loss(preds, targets, epoch_num, step_num,
                                                             batch_height, batch_width) # YOLOv6_af
@@ -287,6 +292,7 @@ class Trainer:
     def before_train_loop(self):
         LOGGER.info('Training start...')
         LOGGER.info(f'AMP training: {self.amp_enabled}')
+        LOGGER.info(f'Fuse AB training: {self.args.fuse_ab}, AB loss weight: {self.ab_loss_weight}')
         self.start_time = time.time()
         if getattr(self.scheduler, 'by_iteration', False):
             self.warmup_stepnum = self.scheduler.warmup_iters

@@ -28,6 +28,7 @@ python ./deploy/ONNX/export_onnx.py \
 - `--inplace` : Whether to set Detect() inplace.
 - `--simplify` : Whether to simplify onnx. Not support in end to end export.
 - `--end2end` : Whether to export end to end onnx model. Only support onnxruntime and TensorRT >= 8.0.0 .
+- `--raw-head` : Export Pico P3/P4/P5 maps without anchor generation or box decoding; mutually exclusive with `--end2end`.
 - `--trt-version` :  Export onnx for TensorRT version. Support : 7 or 8.
 - `--ort` : Whether to export onnx for onnxruntime backend.
 - `--with-preprocess` : Whether to export preprocess with bgr2rgb and normalize (divide by 255)
@@ -70,6 +71,12 @@ python deploy/ONNX/export_onnx.py --weights pico.pt \
     --img-size 416 --device cpu --dynamic-batch --simplify
 ```
 
+Setting `model['neck']['upsample_type'] = 'sni'` selects soft nearest-neighbor
+interpolation: each 2x top-down upsampling is multiplied by 1/4. SNI adds no
+learned parameters and exports as standard ONNX Resize and Mul at opset 13,
+including with `--raw-head`. Train with the SNI config before exporting its
+checkpoint; export uses the modules stored in the checkpoint.
+
 Setting `upsample_type='dysample'` enables learned sampling. Such models include
 `grid_sample`, requiring PyTorch 1.13 or newer, `onnx>=1.12`, and ONNX opset 16
 or newer. Use a separate export environment if training runs on PyTorch 1.10:
@@ -81,8 +88,37 @@ python deploy/ONNX/export_onnx.py --weights pico.pt \
 
 This writes `pico.onnx`, containing decoded predictions `[B,N,5+nc]`. The default
 export does not include NMS. When DySample is enabled, the runtime must support
-ONNX `GridSample`; check the target TensorRT/backend version separately. `Detect.export=True` is not
-needed: the existing model export path returns the decoded tensor.
+ONNX `GridSample`; check the target TensorRT/backend version separately.
+
+To remove anchor generation and box decoding from the Pico ONNX graph, export
+the three head maps instead:
+
+```bash
+python deploy/ONNX/export_onnx.py --weights pico.pt \
+    --output pico_raw.onnx --img-size 416 --device cpu \
+    --raw-head --dynamic-batch --simplify
+```
+
+For a single class at 416x416, the outputs are `p3=[B,5,52,52]`,
+`p4=[B,5,26,26]`, and `p5=[B,5,13,13]`, at strides 8, 16 and 32.
+Channels are `[class probabilities..., l, t, r, b]`; probabilities already
+include sigmoid. The four distances are raw LTRB offsets in feature-grid units,
+with no DFL, clipping or extra activation. There is no objectness channel.
+The deployment postprocessor must decode the boxes and perform NMS. For grid
+position `(x,y)` at stride `s`, the pixel coordinates are:
+
+```text
+x1 = (x + 0.5 - l) * s       y1 = (y + 0.5 - t) * s
+x2 = (x + 0.5 + r) * s       y2 = (y + 0.5 + b) * s
+```
+
+`Model.export` only suppresses the outer feature-map return; the separate
+`model.detect.export` flag selects the head's early return before
+`generate_anchors()` and `dist2bbox()`. `--raw-head` sets both flags, assigns
+three output names and applies dynamic-batch axes to all outputs. Default
+export explicitly keeps Pico decoding enabled. `--raw-head` supports PicoHead
+only and cannot be combined with `--end2end`, which requires decoded boxes.
+This flag does not remove DySample sampling grids when that upsampler is used.
 
 The exporter inspects the loaded checkpoint's modules, so existing DySample
 checkpoints still select opset 16 even after changing the default config.

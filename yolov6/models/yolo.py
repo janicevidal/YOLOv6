@@ -11,6 +11,7 @@ from yolov6.models.reppan import *
 from yolov6.models.pico_backbone import PicoBackbone
 from yolov6.models.lite_backbone import LiteBackbone
 from yolov6.models.pico_neck import PicoNeck
+from yolov6.models.pico_bifpan import PicoBiFPANNeck
 from yolov6.utils.events import LOGGER
 
 
@@ -20,7 +21,7 @@ class Model(nn.Module):
     The default parts are EfficientRep Backbone, Rep-PAN and
     Efficient Decoupled Head.
     '''
-    def __init__(self, config, channels=3, num_classes=None, fuse_ab=False, distill_ns=False):  # model, input channels, number of classes
+    def __init__(self, config, channels=3, num_classes=None, fuse_ab=None, distill_ns=False):  # model, input channels, number of classes
         super().__init__()
         # Build network
         num_layers = config.model.head.num_layers
@@ -117,9 +118,11 @@ def _build_rep_backbone_neck(config, channels):
 
 def _build_pico_backbone_neck(config, channels, num_layers):
     backbones = {'PicoBackbone': PicoBackbone, 'LiteBackbone': LiteBackbone}
+    necks = {'PicoNeck': PicoNeck, 'PicoBiFPANNeck': PicoBiFPANNeck}
     backbone_type = config.model.backbone.type
-    if backbone_type not in backbones or config.model.neck.type != 'PicoNeck':
-        raise ValueError('Configure PicoNeck with PicoBackbone or LiteBackbone')
+    neck_type = config.model.neck.type
+    if backbone_type not in backbones or neck_type not in necks:
+        raise ValueError('Configure a Pico neck with PicoBackbone or LiteBackbone')
     if num_layers != 3 or list(config.model.head.strides) != [8, 16, 32]:
         raise ValueError('Pico requires three detection levels with strides [8, 16, 32]')
 
@@ -129,23 +132,28 @@ def _build_pico_backbone_neck(config, channels, num_layers):
     required_stages = (0, 1, 2) if backbone_type == 'PicoBackbone' else (2, 3, 4)
     if tuple(backbone.out_stages) != required_stages:
         raise ValueError(f'{backbone_type} must output backbone stages {required_stages} for YOLOv6')
+    requires_p2 = neck_type == 'PicoBiFPANNeck'
+    if bool(backbone.out_p2) != requires_p2:
+        raise ValueError(f'{neck_type} requires backbone.out_p2={requires_p2}')
 
     neck_cfg = dict(config.model.neck)
     neck_cfg.pop('type')
     neck_channels = neck_cfg.pop('in_channels', backbone.out_channels)
     if list(neck_channels) != backbone.out_channels:
-        raise ValueError('PicoNeck input channels must match backbone outputs')
+        raise ValueError(f'{neck_type} input channels must match backbone outputs')
     if neck_cfg.get('num_extra_level', 0) != 0:
         raise ValueError('The three-level Pico detection head requires num_extra_level=0')
-    neck = PicoNeck(in_channels=backbone.out_channels, **neck_cfg)
+    neck = necks[neck_type](in_channels=backbone.out_channels, **neck_cfg)
     head_channels = [neck.out_channels] * num_layers
     if list(config.model.head.get('in_channels', head_channels)) != head_channels:
         raise ValueError('Detection head input channels must match PicoNeck outputs')
     return backbone, neck, head_channels
 
 
-def build_network(config, channels, num_classes, num_layers, fuse_ab=False, distill_ns=False):
-    if config.model.backbone.type in ('PicoBackbone', 'LiteBackbone') or config.model.neck.type == 'PicoNeck':
+def build_network(config, channels, num_classes, num_layers, fuse_ab=None, distill_ns=False):
+    if fuse_ab is None:
+        fuse_ab = config.model.head.get('fuse_ab', False)
+    if config.model.backbone.type in ('PicoBackbone', 'LiteBackbone') or config.model.neck.type in ('PicoNeck', 'PicoBiFPANNeck'):
         backbone, neck, channels_list = _build_pico_backbone_neck(config, channels, num_layers)
     else:
         backbone, neck, channels_list = _build_rep_backbone_neck(config, channels)
@@ -153,14 +161,15 @@ def build_network(config, channels, num_classes, num_layers, fuse_ab=False, dist
     reg_max = config.model.head.reg_max
 
     if config.model.head.type == 'PicoHead':
-        if config.model.backbone.type not in ('PicoBackbone', 'LiteBackbone') or config.model.neck.type != 'PicoNeck':
-            raise ValueError('PicoHead requires PicoNeck with PicoBackbone or LiteBackbone')
-        if fuse_ab or distill_ns:
-            raise ValueError('PicoHead does not support fuse_ab or distillation')
+        if config.model.backbone.type not in ('PicoBackbone', 'LiteBackbone') or config.model.neck.type not in ('PicoNeck', 'PicoBiFPANNeck'):
+            raise ValueError('PicoHead requires a Pico neck with PicoBackbone or LiteBackbone')
+        if distill_ns:
+            raise ValueError('PicoHead does not support distillation')
         if use_dfl or reg_max != 0:
             raise ValueError('PicoHead requires use_dfl=False and reg_max=0 for direct LTRB regression')
         from yolov6.models.heads.effidehead_pico import Detect
-        head = Detect(num_classes, channels_list, config.model.head.strides)
+        head = Detect(num_classes, channels_list, config.model.head.strides,
+                      fuse_ab=fuse_ab, anchors_init=config.model.head.get('anchors_init'))
 
     elif distill_ns:
         from yolov6.models.heads.effidehead_distill_ns import Detect, build_effidehead_layer
@@ -184,6 +193,6 @@ def build_network(config, channels, num_classes, num_layers, fuse_ab=False, dist
     return backbone, neck, head
 
 
-def build_model(cfg, num_classes, device, fuse_ab=False, distill_ns=False):
+def build_model(cfg, num_classes, device, fuse_ab=None, distill_ns=False):
     model = Model(cfg, channels=3, num_classes=num_classes, fuse_ab=fuse_ab, distill_ns=distill_ns).to(device)
     return model

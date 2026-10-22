@@ -48,6 +48,7 @@ class PicoBackbone(nn.Module):
 
     Outputs [48, 96, 192] at strides [8, 16, 32] — identical interface
     to LiteBackbone(model_size="0.5x", out_stages=(2, 3, 4)).
+    out_p2=True additionally returns the pooled stem at stride 4, first.
 
     Parameter budget: ~135K (comparable to LiteBackbone-0.5x backbone).
     """
@@ -61,6 +62,7 @@ class PicoBackbone(nn.Module):
         activation: str = "LeakyReLU",
         pretrained: bool = False,
         in_channels: int = 3,
+        out_p2: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -78,7 +80,10 @@ class PicoBackbone(nn.Module):
         if min(out_stages) < 0 or max(out_stages) >= len(stage_channels):
             raise ValueError("out_stages contains an invalid Pico stage index")
         self.out_stages = out_stages
+        self.out_p2 = out_p2
         self.out_channels = [stage_channels[s] for s in out_stages]
+        if out_p2:
+            self.out_channels.insert(0, stem_channels)
 
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, stem_channels, 3, 2, 1, bias=False),
@@ -112,6 +117,9 @@ class PicoBackbone(nn.Module):
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         x = self.pool(self.stem(x))
         outputs: List[torch.Tensor] = []
+        # getattr also supports older serialized backbones without this flag.
+        if getattr(self, 'out_p2', False):
+            outputs.append(x)
         for i, stage in enumerate(self.stages):
             x = stage(x)
             if i in self.out_stages:

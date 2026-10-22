@@ -104,6 +104,7 @@ class LiteBackbone(nn.Module):
     Stage numbers 2/3/4 correspond to strides 8/16/32. Pretraining defaults
     to False so a backbone comparison starts both models from random weights.
     Enabling it downloads torchvision ShuffleNet V2 weights on first use.
+    out_p2=True additionally returns the stride-4 maxpool output, first.
     """
 
     STAGE_CONFIGS = {
@@ -115,7 +116,7 @@ class LiteBackbone(nn.Module):
 
     def __init__(self, model_size: str = "0.5x", out_stages: tuple = (2, 3, 4),
                  pretrained: bool = False, activation: str = "LeakyReLU",
-                 in_channels: int = 3):
+                 in_channels: int = 3, out_p2: bool = False):
         super().__init__()
         if model_size not in self.STAGE_CONFIGS:
             raise ValueError(f'Unsupported LiteBackbone model_size: {model_size}')
@@ -126,8 +127,11 @@ class LiteBackbone(nn.Module):
         if pretrained and in_channels != 3:
             raise ValueError('ImageNet pretrained LiteBackbone requires three input channels')
         self.out_stages = tuple(out_stages)
+        self.out_p2 = out_p2
         repeats, channels = self.STAGE_CONFIGS[model_size]
         self.out_channels = [channels[stage - 1] for stage in out_stages]
+        if out_p2:
+            self.out_channels.insert(0, channels[0])
         self.conv1 = nn.Sequential(
             nn.Conv2d(in_channels, channels[0], 3, 2, 1, bias=False),
             nn.BatchNorm2d(channels[0]),
@@ -162,6 +166,8 @@ class LiteBackbone(nn.Module):
     def forward(self, x: torch.Tensor) -> list:
         x = self.maxpool(self.conv1(x))
         outputs = []
+        if getattr(self, 'out_p2', False):
+            outputs.append(x)
         for stage, name in enumerate(self.stage_names, start=2):
             x = getattr(self, name)(x)
             if stage in self.out_stages:
