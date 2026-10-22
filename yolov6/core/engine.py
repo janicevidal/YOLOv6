@@ -42,6 +42,7 @@ class Trainer:
         self.ckpt_dtype = torch.float32 if getattr(args, 'save_fp32', False) else torch.float16
         self.cfg = cfg
         self.device = device
+        self.amp_enabled = getattr(cfg, 'amp', True) and torch.device(device).type == 'cuda'
         self.max_epoch = args.epochs
 
         if args.resume:
@@ -152,7 +153,7 @@ class Trainer:
             write_tbimg(self.tblogger, self.vis_train_batch, self.step + self.max_stepnum * self.epoch, type='train')
 
         # forward
-        with amp.autocast(enabled=self.device != 'cpu'):
+        with amp.autocast(enabled=self.amp_enabled):
             _, _, batch_height, batch_width = images.shape
             preds, s_featmaps = self.model(images)
             if self.args.distill:
@@ -285,6 +286,7 @@ class Trainer:
 
     def before_train_loop(self):
         LOGGER.info('Training start...')
+        LOGGER.info(f'AMP training: {self.amp_enabled}')
         self.start_time = time.time()
         if getattr(self.scheduler, 'by_iteration', False):
             self.warmup_stepnum = self.scheduler.warmup_iters
@@ -302,7 +304,7 @@ class Trainer:
                 start_iter=self.start_epoch * self.max_stepnum,
             )
         self.last_opt_step = -1
-        self.scaler = amp.GradScaler(enabled=self.device != 'cpu')
+        self.scaler = amp.GradScaler(enabled=self.amp_enabled)
 
         self.best_ap, self.ap = 0.0, 0.0
         self.best_stop_strong_aug_ap = 0.0
@@ -527,7 +529,8 @@ class Trainer:
     def get_optimizer(self, args, cfg, model):
         accumulate = max(1, round(64 / args.batch_size))
         cfg.solver.weight_decay *= args.batch_size * accumulate / 64
-        cfg.solver.lr0 *= args.batch_size / (self.world_size * args.bs_per_gpu) # rescale lr0 related to batchsize
+        if cfg.solver.get('lr_scale', True):
+            cfg.solver.lr0 *= args.batch_size / (self.world_size * args.bs_per_gpu)
         optimizer = build_optimizer(cfg, model)
         return optimizer
 

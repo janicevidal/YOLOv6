@@ -67,11 +67,30 @@ class AlignOTAAssigner(nn.Module):
                         torch.zeros_like(scores), torch.zeros(scores.shape[:2], dtype=torch.bool,
                                                               device=scores.device))
 
+            self.validate_inputs(scores, boxes, gt_boxes)
             candidates, inside = self.get_candidates(points, strides, gt_boxes, valid_gt)
             cost, overlaps = self.get_box_metrics(scores, boxes, labels, gt_boxes, inside)
             matched_ious, matched_gt, fg_mask = self.dynamic_k_matching(
                 cost, overlaps, valid_gt, candidates)
             return self.get_targets(labels, gt_boxes, matched_gt, matched_ious, fg_mask)
+
+    @staticmethod
+    def validate_inputs(scores, boxes, gt_boxes):
+        """Reject invalid predictions before BCE can poison the CUDA context."""
+        tensors = (('pd_scores', scores), ('pd_bboxes', boxes), ('gt_bboxes', gt_boxes))
+        valid = ((scores >= 0) & (scores <= 1), torch.isfinite(boxes), torch.isfinite(gt_boxes))
+        # One host synchronization for all checks in a healthy batch.
+        if torch.stack([mask.all() for mask in valid]).all():
+            return
+        for (name, tensor), mask in zip(tensors, valid):
+            if not mask.all():
+                index = tuple((~mask).nonzero(as_tuple=False)[0].tolist())
+                value = tensor[index].item()
+                requirement = 'finite probabilities in [0, 1]' if name == 'pd_scores' else 'finite coordinates'
+                raise FloatingPointError(
+                    'AlignOTA requires {}; {}{}={}. Check model outputs, AMP, '
+                    'learning rate and upstream losses; this is not a CUDA OOM.'.format(
+                        requirement, name, index, value))
 
     def get_candidates(self, anchor_points, strides, gt_bboxes, mask_gt):
         """Return candidate union [B,N] and box/center intersection [B,N,G]."""

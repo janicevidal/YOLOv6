@@ -91,12 +91,11 @@ class IOUloss(nn.Module):
     def forward(self, box1, box2):
         """ calculate iou. box1 and box2 are torch tensor with shape [M, 4] and [Nm 4].
         """
-        if self.iou_type in ['fociou', 'wiou']:
-            # Keep eps and box areas representable when called with AMP outputs.
-            if box1.dtype in (torch.float16, torch.bfloat16):
-                box1 = box1.float()
-            if box2.dtype in (torch.float16, torch.bfloat16):
-                box2 = box2.float()
+        # Keep eps, box areas and aspect ratios representable with AMP inputs.
+        if box1.dtype in (torch.float16, torch.bfloat16):
+            box1 = box1.float()
+        if box2.dtype in (torch.float16, torch.bfloat16):
+            box2 = box2.float()
         if box1.shape[0] != box2.shape[0]:
             box2 = box2.T
             if self.box_format == 'xyxy':
@@ -151,11 +150,9 @@ class IOUloss(nn.Module):
             else:
                 v = (4 / math.pi ** 2) * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
                 with torch.no_grad():
-                    if self.iou_type == 'fociou':
-                        # Add eps last: (1 + eps) can round to 1 in FP32.
-                        alpha = v / (1 - iou + v + self.eps)
-                    else:
-                        alpha = v / (v - iou + (1 + self.eps))
+                    # Add eps last: (1 + eps) rounds to 1 in FP32, giving
+                    # 0/0 for identical boxes (IoU=1, v=0), including CIoU.
+                    alpha = v / (1 - iou + v + self.eps)
                 if self.iou_type == 'fociou':
                     # YOLO-ULM, Eqs. (7)-(8): 1 - CIoU + IoU - IoU_MF.
                     # Keep raw IoU for alpha; map only the overlap term.

@@ -35,6 +35,13 @@ def time_sync():
     return time.time()
 
 
+def is_cuda_out_of_memory(error):
+    """Recognize CUDA OOMs, including RuntimeError messages in PyTorch 1.10."""
+    message = str(error).lower()
+    return isinstance(error, RuntimeError) and (
+        'cuda out of memory' in message or 'cuda error: out of memory' in message)
+
+
 def initialize_weights(model):
     for m in model.modules():
         t = type(m)
