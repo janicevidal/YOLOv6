@@ -58,6 +58,21 @@ class PicoBiFusion(nn.Module):
         return self.cv3(torch.cat([up, lateral, fine], dim=1))
 
 
+class PicoRefine(nn.Module):
+    """Residual depthwise/pointwise refinement"""
+
+    def __init__(self, channels, kernel_size, activation="LeakyReLU"):
+        super().__init__()
+        if not isinstance(kernel_size, int) or kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError('Refine kernel_size must be a positive odd integer')
+        self.dw = ConvModule(channels, channels, kernel_size, groups=channels,
+                             activation=activation)
+        self.pw = ConvModule(channels, channels, 1, activation=None)
+
+    def forward(self, x):
+        return x + self.pw(self.dw(x))
+
+
 class PicoBiFPANNeck(nn.Module):
     """Fuse backbone P2/P3/P4/P5 and return detection levels P3/P4/P5.
 
@@ -70,6 +85,9 @@ class PicoBiFPANNeck(nn.Module):
     upsample_type accepts the same nearest/SNI/DySample modes as PicoNeck.
     activation configures both BiFusion and the other Pico modules;
     use_depthwise configures PAN downsampling.
+    use_refine adds residual depthwise/pointwise blocks after the top-down
+    LiteBlocks, before subsequent fusion/PAN. refine_kernel_sizes is ordered
+    as (P3, P4); refinement is disabled by default for existing configurations.
     """
 
     def __init__(
@@ -84,6 +102,8 @@ class PicoBiFPANNeck(nn.Module):
         use_depthwise: bool = True,
         activation: str = "LeakyReLU",
         upsample_type: str = "nearest",
+        use_refine: bool = False,
+        refine_kernel_sizes: tuple = (5, 3),
     ):
         super().__init__()
         if len(in_channels) != 4:
@@ -121,6 +141,14 @@ class PicoBiFPANNeck(nn.Module):
                        use_res=use_res, activation=activation)
             for _ in range(2)
         ])
+        if use_refine:
+            if len(refine_kernel_sizes) != 2:
+                raise ValueError('refine_kernel_sizes must contain (P3, P4) kernel sizes')
+            self.p3_refine = PicoRefine(out_channels, refine_kernel_sizes[0], activation)
+            self.p4_refine = PicoRefine(out_channels, refine_kernel_sizes[1], activation)
+        else:
+            self.p3_refine = nn.Identity()
+            self.p4_refine = nn.Identity()
 
     def forward(self, inputs: list) -> list:
         if len(inputs) != 4:
@@ -128,7 +156,11 @@ class PicoBiFPANNeck(nn.Module):
         p2, p3, p4, p5 = inputs
         p5 = self.reduce_layer(p5)
         p4 = self.top_down_blocks[0](self.bifusions[0]([p5, p4, p3]))
+        if hasattr(self, 'p4_refine'):
+            p4 = self.p4_refine(p4)
         p3 = self.top_down_blocks[1](self.bifusions[1]([p4, p3, p2]))
+        if hasattr(self, 'p3_refine'):
+            p3 = self.p3_refine(p3)
 
         n4 = self.bottom_up_blocks[0](torch.cat([self.downsamples[0](p3), p4], dim=1))
         n5 = self.bottom_up_blocks[1](torch.cat([self.downsamples[1](n4), p5], dim=1))
