@@ -486,7 +486,8 @@ class Trainer:
             if not os.path.exists(weights):
                 download_ckpt(weights)
             LOGGER.info(f'Loading state_dict from {weights} for fine-tuning...')
-            model = load_state_dict(weights, model, map_location=device)
+            model = load_state_dict(weights, model, map_location=device,
+                                    exclude_keys=cfg.model.get('pretrained_exclude', ()))
 
         LOGGER.info('Model: {}'.format(model))
         return model
