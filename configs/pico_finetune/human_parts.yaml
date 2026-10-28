@@ -1,0 +1,12 @@
+# Person-only conversion: python utils/convert_human_parts.py
+# Preserve the official split: train 12,000 images / val 2,962 images.
+# Retain person boxes only: train 28,408 / val 6,898; discard face/hand boxes.
+train: /data/xiaoshuai/human_detection/human_parts/images/train
+val: /data/xiaoshuai/human_detection/human_parts/images/val
+anno_path: /data/xiaoshuai/human_detection/human_parts/annotations/human_parts_val.json
+
+nc: 1
+names: ['person']
+# Non-COCO dataset: filenames are SHA hashes, not integer COCO image IDs.
+# Evaluation JSON uses string image stems, zero-based classes, positive annotation IDs.
+is_coco: False

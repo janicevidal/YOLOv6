@@ -293,6 +293,7 @@ class Trainer:
         LOGGER.info('Training start...')
         LOGGER.info(f'AMP training: {self.amp_enabled}')
         LOGGER.info(f'Fuse AB training: {self.args.fuse_ab}, AB loss weight: {self.ab_loss_weight}')
+        LOGGER.info(f'Area loss weighting: {self.cfg.model.head.get("area_weight", {"enabled": False})}')
         self.start_time = time.time()
         if getattr(self.scheduler, 'by_iteration', False):
             self.warmup_stepnum = self.scheduler.warmup_iters
@@ -329,6 +330,7 @@ class Trainer:
                                         reg_max=self.cfg.model.head.reg_max,
                                         iou_type=self.cfg.model.head.iou_type,
                                         iou_kwargs=self.cfg.model.head.get('iou_kwargs'),
+                                        area_weight=self.cfg.model.head.get('area_weight'),
                                         tal_topk=self.cfg.model.head.get('tal_topk', 13),
                                         assigner_type=self.cfg.model.head.get('assigner_type', 'tal'),
                                         assigner_kwargs=self.cfg.model.head.get('assigner_kwargs'),
@@ -342,6 +344,7 @@ class Trainer:
                                         reg_max=0,
                                         iou_type=self.cfg.model.head.iou_type,
                                         iou_kwargs=self.cfg.model.head.get('iou_kwargs'),
+                                        area_weight=self.cfg.model.head.get('area_weight'),
                                         tal_topk=self.cfg.model.head.get('tal_topk_ab', 26),
                                         assigner_type=self.cfg.model.head.get('assigner_type', 'tal'),
                                         assigner_kwargs=self.cfg.model.head.get('assigner_kwargs'),
@@ -361,6 +364,7 @@ class Trainer:
                                                         reg_max=self.cfg.model.head.reg_max,
                                                         iou_type=self.cfg.model.head.iou_type,
                                                         iou_kwargs=self.cfg.model.head.get('iou_kwargs'),
+                                                        area_weight=self.cfg.model.head.get('area_weight'),
                                                         distill_weight = self.cfg.model.head.distill_weight,
                                                         distill_feat = self.args.distill_feat,
                                                         tal_topk=self.cfg.model.head.get('tal_topk', 13),

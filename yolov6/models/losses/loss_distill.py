@@ -10,6 +10,7 @@ from yolov6.utils.general import dist2bbox, bbox2dist, xywh2xyxy
 from yolov6.utils.figure_iou import IOUloss
 from yolov6.assigners.atss_assigner import ATSSAssigner
 from yolov6.assigners.build import build_assigner
+from yolov6.models.losses.area_weight import AreaLossWeight, apply_bbox_area_weight
 
 
 class ComputeLoss:
@@ -38,6 +39,7 @@ class ComputeLoss:
                  iou_kwargs=None,
                  assigner_type='tal',
                  assigner_kwargs=None,
+                 area_weight=None,
                  ):
 
         self.fpn_strides = fpn_strides
@@ -59,6 +61,7 @@ class ComputeLoss:
         self.bbox_loss = BboxLoss(self.num_classes, self.reg_max, self.use_dfl,
                                   self.iou_type, iou_kwargs=iou_kwargs).cuda()
         self.loss_weight = loss_weight
+        self.area_weight = AreaLossWeight(**(area_weight or {}))
         self.distill_feat = distill_feat
         self.distill_weight = distill_weight
 
@@ -175,13 +178,16 @@ class ComputeLoss:
         if step_num % 10 == 0:
             torch.cuda.empty_cache()
 
+        area_weights = self.area_weight(target_bboxes, target_scores, fg_mask)
+
         # rescale bbox
         target_bboxes /= stride_tensor
 
         # cls loss
         target_labels = torch.where(fg_mask > 0, target_labels, torch.full_like(target_labels, self.num_classes))
         one_hot_label = F.one_hot(target_labels.long(), self.num_classes + 1)[..., :-1]
-        loss_cls = self.varifocal_loss(pred_scores, target_scores, one_hot_label)
+        loss_cls = self.varifocal_loss(pred_scores, target_scores, one_hot_label,
+                                      sample_weight=area_weights.get('class'))
 
         target_scores_sum = target_scores.sum()
         # avoid devide zero error, devide by zero will cause loss to be inf or nan.
@@ -190,7 +196,8 @@ class ComputeLoss:
 
         # bbox loss
         loss_iou, loss_dfl, d_loss_dfl = self.bbox_loss(pred_distri, pred_bboxes, t_pred_distri, t_pred_bboxes, temperature, anchor_points_s,
-                                                     target_bboxes, target_scores, target_scores_sum, fg_mask)
+                                                     target_bboxes, target_scores, target_scores_sum, fg_mask,
+                                                     area_weights=area_weights)
 
         logits_student = pred_scores
         logits_teacher = t_pred_scores
@@ -273,9 +280,11 @@ class VarifocalLoss(nn.Module):
     def __init__(self):
         super(VarifocalLoss, self).__init__()
 
-    def forward(self, pred_score,gt_score, label, alpha=0.75, gamma=2.0):
+    def forward(self, pred_score,gt_score, label, alpha=0.75, gamma=2.0, sample_weight=None):
 
         weight = alpha * pred_score.pow(gamma) * (1 - label) + gt_score * label
+        if sample_weight is not None:
+            weight = weight * torch.where(label > 0, sample_weight, torch.ones_like(sample_weight))
         with torch.cuda.amp.autocast(enabled=False):
             loss = (F.binary_cross_entropy(pred_score.float(), gt_score.float(), reduction='none') * weight).sum()
 
@@ -292,7 +301,7 @@ class BboxLoss(nn.Module):
         self.use_dfl = use_dfl
 
     def forward(self, pred_dist, pred_bboxes, t_pred_dist, t_pred_bboxes, temperature, anchor_points,
-                target_bboxes, target_scores, target_scores_sum, fg_mask):
+                target_bboxes, target_scores, target_scores_sum, fg_mask, area_weights=None):
         # select positive samples mask
         num_pos = fg_mask.sum()
         if num_pos > 0:
@@ -306,8 +315,9 @@ class BboxLoss(nn.Module):
                 target_bboxes, bbox_mask).reshape([-1, 4])
             bbox_weight = torch.masked_select(
                 target_scores.sum(-1), fg_mask).unsqueeze(-1)
+            iou_weight = apply_bbox_area_weight(bbox_weight, area_weights, fg_mask, 'iou')
             loss_iou = self.iou_loss(pred_bboxes_pos,
-                                     target_bboxes_pos) * bbox_weight
+                                     target_bboxes_pos) * iou_weight
             if target_scores_sum == 0:
                 loss_iou = loss_iou.sum()
             else:
@@ -324,8 +334,9 @@ class BboxLoss(nn.Module):
                 target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max)
                 target_ltrb_pos = torch.masked_select(
                     target_ltrb, bbox_mask).reshape([-1, 4])
+                dfl_weight = apply_bbox_area_weight(bbox_weight, area_weights, fg_mask, 'dfl')
                 loss_dfl = self._df_loss(pred_dist_pos,
-                                        target_ltrb_pos) * bbox_weight
+                                        target_ltrb_pos) * dfl_weight
                 d_loss_dfl = self.distill_loss_dfl(pred_dist_pos, t_pred_dist_pos, temperature) * bbox_weight
                 if target_scores_sum == 0:
                     loss_dfl = loss_dfl.sum()

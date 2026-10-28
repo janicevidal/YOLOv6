@@ -1,0 +1,13 @@
+# Convert with: python tools/convert_ochuman.py
+# Train on all 5,081 images / 13,360 detection boxes in the original ochuman.json.
+# This includes OCHuman's official val/test images; do not report a held-out
+# OCHuman benchmark score for a model trained with this configuration.
+# Validation is unchanged from coco_person.yaml (COCO person val2017).
+train: /data/xiaoshuai/human_detection/ochuman_person/images/train
+val: /data/xiaoshuai/human_detection/coco_person/images/val2017
+anno_path: /data/xiaoshuai/human_detection/coco_person/annotations/instances_val2017_person.json
+
+nc: 1
+# True because evaluation uses COCO IDs/annotations, not because training is COCO.
+is_coco: True
+names: [ 'person', ]
